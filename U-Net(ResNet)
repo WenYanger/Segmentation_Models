@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torchvision import models
+import torchvision
+from Model.Git.modeling.deeplab import DeepLab
+from Model.Git2.networks.pspnet import ResNet as PSPNet
+# sub-parts of models
+from tensorboardX import SummaryWriter
+
+def conv3x3(in_ch, out_ch):
+    # padding=0 in original paper
+    return nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+
+class ConvRelu(nn.Module):
+    def __init__(self, in_: int, out: int):
+        super().__init__()
+        self.conv = conv3x3(in_, out)
+        self.drop = nn.Dropout(0.2)
+        self.bn = nn.BatchNorm2d(out)
+        # self.activation = nn.ReLU(inplace=True)
+        self.activation = nn.LeakyReLU(negative_slope=0.2)
+
+    def forward(self, x):
+        x = self.drop(x)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.activation(x)
+        return x
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, scale=2):
+        super(DecoderBlock, self).__init__()
+        self.block = nn.Sequential(
+            ConvRelu(in_channels, in_channels),
+            nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2*scale, stride=scale, padding=scale//2),
+            nn.ReLU(inplace=True),
+            ConvRelu(in_channels, out_channels),
+        )
+    def forward(self, x):
+        return self.block(x)
+
+
+class U_Net_Res18(nn.Module):
+    def __init__(self):
+        super(U_Net_Res18, self).__init__()
+
+        self.maxpool = nn.MaxPool2d(2)
+        resnet = models.resnet18(pretrained=True)
+
+        # Encoder
+        self.firstconv = resnet.conv1
+        self.firstbn = resnet.bn1
+        self.firstrelu = resnet.relu
+        self.firstmaxpool = resnet.maxpool
+        self.encoder1 = resnet.layer1
+        self.encoder2 = resnet.layer2
+        self.encoder3 = resnet.layer3
+        self.encoder4 = resnet.layer4
+
+        # Decoder
+        self.center = nn.Sequential(ConvRelu(512, 128))
+        self.decoder4 = DecoderBlock(128, 128)
+        self.decoder3 = DecoderBlock(512, 256)
+        self.decoder2 = DecoderBlock(256, 128)
+        self.decoder1 = DecoderBlock(128, 64)
+
+        self.up4 = nn.Sequential(ConvRelu(512 + 128, 512))
+        self.up3 = nn.Sequential(ConvRelu(512, 256))
+        self.up2 = nn.Sequential(ConvRelu(256, 128))
+        self.up1 = nn.Sequential(ConvRelu(128, 64))
+
+        # Final Classifier
+        # self.fc_32 = nn.Conv2d(32, 2, 1, padding=0)
+        self.fc_64 = nn.Conv2d(64, 1, 1, padding=0)
+        # self.fc_128 = nn.Conv2d(128 + 512 + 256, 2, 1, padding=0)
+        # self.fc_256 = nn.Conv2d(256 + 512, 2, 1, padding=0)
+        # self.fc_512 = nn.Conv2d(512, 2, 1, padding=0)
+        self.sigmoid = nn.Sigmoid()
+        self.softmax = nn.Softmax()
+
+
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.upsample4 = nn.Upsample(scale_factor=4, mode='bilinear')
+        self.upsample8 = nn.Upsample(scale_factor=8, mode='bilinear')
+        self.upsample16 = nn.Upsample(scale_factor=16, mode='bilinear')
+        self.upsample32 = nn.Upsample(scale_factor=32, mode='bilinear')
+
+        # self._init_weight()
+
+    def forward(self, x):
+        # Encoder
+        x = self.firstconv(x)  # (bs, 64, 128, 128)
+        x = self.firstbn(x)
+        x = self.firstrelu(x)
+        x_ = self.firstmaxpool(x)  # (bs, 64, 128, 128)
+        e1_ = self.encoder1(x_)  # (bs, 64, 128, 128)
+        e2_ = self.encoder2(e1_)  # (bs, 128, 64, 64)
+        e3_ = self.encoder3(e2_)  # (bs, 256, 32, 32)
+        e4_ = self.encoder4(e3_)  # (bs, 512, 16, 16)
+
+        center = self.center(self.maxpool(e4_))
+
+        # UpSample
+        e4__ = self.up4(torch.cat([e4_, self.decoder4(center)], 1))  # (bs, 512, 16, 16)
+        e3__ = self.up3(torch.cat([e3_, self.decoder3(e4__)], 1))  # (bs, 256, 32, 32)
+        e2__ = self.up2(torch.cat([e2_, self.decoder2(e3__)], 1))  # (bs, 128, 64, 64)
+        e1__ = self.up1(torch.cat([e1_, self.decoder1(e2__)], 1))  # (bs, 64, 128, 128)
+
+        e1 = e1__
+
+        # Using 1x1 Conv as Scoring
+        score_map_1 = self.upsample4(self.fc_64(e1))  # (bs, 1, 64, 64)
+   
+        return score_map_1
